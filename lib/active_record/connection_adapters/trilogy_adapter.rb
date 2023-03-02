@@ -153,23 +153,6 @@ module ActiveRecord
         self.connection = nil
       end
 
-      def raw_execute(sql, name, async: false, allow_retry: false, uses_transaction: true)
-        mark_transaction_written_if_write(sql)
-
-        log(sql, name, async: async) do
-          with_raw_connection(allow_retry: allow_retry, uses_transaction: uses_transaction) do |conn|
-            # Sync any changes since connection last established.
-            if default_timezone == :local
-              conn.query_flags |= ::Trilogy::QUERY_FLAGS_LOCAL_TIMEZONE
-            else
-              conn.query_flags &= ~::Trilogy::QUERY_FLAGS_LOCAL_TIMEZONE
-            end
-
-            conn.query(sql)
-          end
-        end
-      end
-
       def each_hash(result)
         return to_enum(:each_hash, result) unless block_given?
 
@@ -210,6 +193,15 @@ module ActiveRecord
           connect
         end
 
+        def sync_timezone_changes(conn)
+          # Sync any changes since connection last established.
+          if default_timezone == :local
+            conn.query_flags |= ::Trilogy::QUERY_FLAGS_LOCAL_TIMEZONE
+          else
+            conn.query_flags &= ~::Trilogy::QUERY_FLAGS_LOCAL_TIMEZONE
+          end
+        end
+
         def full_version
           schema_cache.database_version.full_version_string
         end
@@ -229,6 +221,57 @@ module ActiveRecord
 
         def default_prepared_statements
           false
+        end
+
+
+        def multi_statements_enabled?
+          @config[:multi_statement] || false
+        end
+
+        def execute_batch(statements, name = nil)
+          statements = statements.map { |sql| transform_query(sql) }
+          combine_multi_statements(statements).each do |statement|
+            disconnect!
+            # require 'debug'; debugger
+            with_multi_statement_connection do |conn|
+              raw_execute(statement, name)
+            end
+          end
+        end
+
+        def with_multi_statement_connection
+          multi_statements_enabled = multi_statements_enabled?
+          @config.merge(multi_statement: true) unless multi_statements_enabled
+          with_raw_connection { yield }
+        ensure
+          @config.delete(:multi_statement) unless multi_statements_enabled
+        end
+
+        def combine_multi_statements(total_sql)
+          total_sql.each_with_object([]) do |sql, total_sql_chunks|
+            previous_packet = total_sql_chunks.last
+            if max_allowed_packet_reached?(sql, previous_packet)
+              total_sql_chunks << +sql
+            else
+              previous_packet << ";\n"
+              previous_packet << sql
+            end
+          end
+        end
+
+        def max_allowed_packet_reached?(current_packet, previous_packet)
+          if current_packet.bytesize > max_allowed_packet
+            raise ActiveRecordError,
+              "Fixtures set is too large #{current_packet.bytesize}. Consider increasing the max_allowed_packet variable."
+          elsif previous_packet.nil?
+            true
+          else
+            (current_packet.bytesize + previous_packet.bytesize + 2) > max_allowed_packet
+          end
+        end
+
+        def max_allowed_packet
+          @max_allowed_packet ||= show_variable("max_allowed_packet")
         end
     end
   end
